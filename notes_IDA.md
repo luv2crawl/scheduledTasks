@@ -84,6 +84,8 @@ Eventually make a call to ITaskService::NewTask
 
 There are a number of COM object methods implemented in taskschd.dll that are called when an application wants to create a scheduled task. While `ITaskService::NewTask` seems like the natural place to start, this method is essentially a setup step. Dynamic analysis showed us that two registry keys and a file are created when we create a task with schtasks.exe, but none of these operations occur in `ITaskService::NewTask`. This aspect of COM can be a bit difficult to reverse because the client (schtasks) is responsible for stitching together calls to `ITaskService::GetFolder`, `ITaskService::NewTask`, functions related to populating ITaskDefinition object properties, and `ITaskFolder::RegisterTaskDefinition`.
 
+This flow essentially boils down to schtasks 1) instantianting and populating an ITaskDefinition object and then 2) passing that populated object to `ITaskFolder::RegisterTaskDefinition`. With this in mind, we will begin our COM server-side analysis with the implementation of RegisterTaskDefinition in taskschd.dll.
+
 
 
 
