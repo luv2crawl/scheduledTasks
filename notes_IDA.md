@@ -86,9 +86,120 @@ There are a number of COM object methods implemented in taskschd.dll that are ca
 
 This flow essentially boils down to schtasks 1) instantianting and populating an ITaskDefinition object and then 2) passing that populated object to `ITaskFolder::RegisterTaskDefinition`. With this in mind, we will begin our COM server-side analysis with the implementation of RegisterTaskDefinition in taskschd.dll.
 
+1. The server side implementation of the ITaskFolder COM server is located in `C:\Windows\System32\taskschd.dll`
+2. We can easily find an internal function named "RegisterTaskFolder", which is just a wrapper that passes several paramaters to another function named `TaskFolderImpl::Register`
+3. `TaskFolderImpl::Register` makes a call to `RpcSession::RegisterTask`
+4. `RpcSession::RegisterTask` uses NdrClientCall to make an RPC call
+
+### RPC Call
+
+Looking at the paramaters passed to NdrClientCall from `RpcSession::RegisterTask`, we learn the following:
+- We are interacting with the [Task Scheduler Service Remoting Protocol (MS-TSCH)](https://docs.microsoft.com/en-us/openspecs/windows_protocols/ms-tsch/849c131a-64e4-46ef-b015-9d4c599c5167), which has a interface ID of 86D35949-83C9-4044-B424-DB363231FD0C
+- We are invoking procedure number 1, which corresponds to the procedure named [SchRpcRegisterTask](https://docs.microsoft.com/en-us/openspecs/windows_protocols/ms-tsch/849c131a-64e4-46ef-b015-9d4c599c5167)
 
 
+# Locating the MS-TSCH RPC Server Implementation
 
+## RPC Server Enumeration
+Locate the file where the server-side implementation of the MS-TSCH RPC protocol is located using NtObjectManager
 
-# RPC
-https://docs.microsoft.com/en-us/openspecs/windows_protocols/ms-tsch/849c131a-64e4-46ef-b015-9d4c599c5167
+*ps1:*
+
+    Import-Module -Name NtObjectManager
+
+    $rpc = ls C:\Windows\System32\* | Get-RpcServer
+
+    $guid = '86D35949-83C9-4044-B424-DB363231FD0C'
+
+    $server = $rpc | Where-Object {$_.InterfaceId -eq $guid}
+
+    $server | Select-Object -Property Name, InterfaceId, ProcedureCount, FilePath, IsServiceRunning, Client
+
+*Output:*
+
+    Name             : schedsvc.dll
+    InterfaceId      : 86d35949-83c9-4044-b424-db363231fd0c
+    ProcedureCount   : 20
+    FilePath         : C:\Windows\System32\schedsvc.dll
+    IsServiceRunning : True
+    Client           : False
+
+![](/images/ubpm.png)
+
+## Procedures
+
+$scmrServer = Get-RpcServer -DbgHelpPath 'C:\Program Files (x86)\Windows Kits\10\Debuggers\x64\dbghelp.dll' -FullName C:\Windows\system32\services.exe | Where-Object {$_.InterfaceId -eq '86D35949-83C9-4044-B424-DB363231FD0C'}
+$Proc0 = $scmrServer.Procedures | Where-Object {$_.ProcNum -eq 1}
+
+# SchRpcRegisterTask Analysis
+
+Function def:
+
+    HRESULT SchRpcRegisterTask(
+        [in, string, unique] const wchar_t* path,
+        [in, string] const wchar_t* xml,
+        [in] DWORD flags,
+        [in, string, unique] const wchar_t* sddl,
+        [in] DWORD logonType,
+        [in] DWORD cCreds,
+        [in, size_is(cCreds), unique] const TASK_USER_CRED* pCreds,
+        [out, string] wchar_t** pActualPath,
+        [out] PTASK_XML_ERROR_INFO* pErrorInfo
+    );
+    
+`SchRpcRegisterTask` calls `RpcServer::RegisterTask`:
+
+    v15 = RpcServer::RegisterTask(
+        (RpcServer *)&RpcServer::s_singleton,
+        path,
+        xml,
+        flags,
+        sddl,
+        logonType,
+        cCreds,
+        pCreds,
+        0i64,
+        pActualPath,
+        pErrorInfo,
+        hkey);
+
+# SchRpcRegisterTask Analysis
+
+IDA seems to be very confused about how to decompile the `RpcServer::RegisterTask` method. This seems to be the right way to rename it on the callee side:
+
+    __int64 __fastcall RpcServer::RegisterTask(
+        RpcServer *this,
+        const unsigned __int16 *path,
+        unsigned __int16 *xml,
+        unsigned int flags,
+        unsigned __int16 *sddl,
+        unsigned int logonType,
+        unsigned int cCreds,
+        const struct _TASK_USER_CRED *pCreds,
+        BYTE *a9,
+        unsigned __int16 **pActualPath,
+        struct _TASK_XML_ERROR_INFO **pErrorInfo,
+        struct TschedSqm::V2Server::ITaskFeatures *hkey)
+
+Summary of boring parts before we hit the meat:
+- Lots of WPP related calls depending on specific param values
+- Some conditional logic depending on logonType and cred related params --> ex. interact with SecretGuard depending on pCred value
+
+### XML Handling?
+
+`TaskXMLReader::ProcessXML`
+
+JobStore::SaveTaskXML --> JobStore::SaveJobFile
+
+# Miscellaneous Research Questions
+
+- When does the .job file get written? 
+- How are .job files in C:\Windows\System32\Tasks\ used?
+- When do the two registry keys get written?
+- How are the two registry keys used?
+- Do I have to write both registry keys AND the .job file?
+- How do internal functions access the default .job file path and the reg key paths?
+- When are relevant windows event logs written?
+    - Auditor::AuditJobOperation --> makes a call to AuthziLogAuditEvent, called by SchRpcEnableTask
+    - ETW all over the place --> EventManager::EvtReport
+
